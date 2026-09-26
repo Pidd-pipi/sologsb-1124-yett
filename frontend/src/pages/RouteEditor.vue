@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import RouteTimeline from '@/components/common/RouteTimeline.vue'
 import { buildTimeline, useCoverRoute } from '@/hooks/useCoverRoute'
 import { computeTotalDays, createRouteNode, useRouteStore } from '@/stores/routeStore'
+import type { VoidPlanItem } from '@/stores/routeStore'
 import { useCoverStore } from '@/stores/coverStore'
 import type { Cover } from '@/types/cover'
 import type { PostalRoute, RouteNode, TimelineNode } from '@/types/route'
@@ -204,6 +205,76 @@ async function detachCover(cover: Cover): Promise<void> {
   ElMessage.success('已从邮路摘除')
 }
 
+/* ------------------------------ 作废邮路 ------------------------------ */
+
+/** 作废确认框里的一行：一封待安置的实寄封及其去向选择。 */
+interface VoidRow {
+  coverId: number
+  coverNo: string
+  sentFrom: string
+  sentTo: string
+  /** null = 尚未处理；'unattached' = 留作未关联；数字 = 转挂目标邮路 id */
+  choice: number | 'unattached' | null
+}
+
+const voidDialog = ref(false)
+const voiding = ref(false)
+const voidRows = ref<VoidRow[]>([])
+
+/** 可转挂的其他可用邮路（不含当前这条） */
+const voidTargetOptions = computed(() =>
+  routeStore.list.flatMap((rt) =>
+    typeof rt.id === 'number' && rt.id !== routeId.value
+      ? [{ label: `转挂：${rt.routeNo} ${rt.name}`, value: rt.id }]
+      : []
+  )
+)
+
+const voidPending = computed(() => voidRows.value.filter((row) => row.choice === null).length)
+
+/** 逐封处理完才能撤下邮路 */
+const voidReady = computed(() => voidPending.value === 0)
+
+function openVoidDialog(): void {
+  voidRows.value = attachedCovers.value.flatMap((c) =>
+    typeof c.id === 'number'
+      ? [
+          {
+            coverId: c.id,
+            coverNo: c.coverNo,
+            sentFrom: c.sentFrom,
+            sentTo: c.sentTo,
+            choice: null as VoidRow['choice']
+          }
+        ]
+      : []
+  )
+  voidDialog.value = true
+}
+
+async function confirmVoid(): Promise<void> {
+  const id = routeId.value
+  if (id == null || !voidReady.value) return
+  const plan: VoidPlanItem[] = voidRows.value.map((row) => ({
+    coverId: row.coverId,
+    targetRouteId: row.choice === 'unattached' ? null : row.choice
+  }))
+  voiding.value = true
+  try {
+    await routeStore.voidRoute(id, plan)
+    await coverStore.load()
+    voidDialog.value = false
+    ElMessage.success('邮路已撤下，关联实寄封已按选择重新归属')
+    await router.push('/covers')
+  } catch (err) {
+    // 事务已整体回滚：邮路与其余封均未改动，刷新本地缓存后提示原因
+    await coverStore.load()
+    ElMessage.error(err instanceof Error ? err.message : '作废失败，邮路与实寄封均未改动')
+  } finally {
+    voiding.value = false
+  }
+}
+
 function openCover(cover: Cover): void {
   if (typeof cover.id !== 'number') return
   void router.push(`/covers/${cover.id}`)
@@ -371,6 +442,16 @@ function nodeGanzhi(node: RouteNode): string {
           title="寄递事实时间轴"
         />
       </section>
+
+      <section class="gb-panel route-editor__danger">
+        <h2 class="gb-panel__title">作废邮路</h2>
+        <p class="route-editor__hint">
+          撤下后该邮路不再可用。当前挂有 {{ attachedCovers.length }} 封实寄封，
+          确认前需逐封指定去向（转挂另一条可用邮路，或留作未关联）；
+          任一封未处理或处理失败，邮路与其余封都保持不变。
+        </p>
+        <el-button type="danger" plain @click="openVoidDialog">作废并撤下邮路</el-button>
+      </section>
     </template>
 
     <section v-else class="gb-panel">
@@ -398,6 +479,48 @@ function nodeGanzhi(node: RouteNode): string {
         </el-form-item>
       </el-form>
     </section>
+
+    <el-dialog
+      v-model="voidDialog"
+      :title="`作废邮路 · ${route ? `${route.routeNo} ${route.name}` : ''}`"
+      width="640px"
+    >
+      <el-alert
+        type="warning"
+        show-icon
+        :closable="false"
+        title="撤下后邮路即刻删除，以下实寄封需逐封指定去向；确认后邮路与各封归属一起生效。"
+      />
+      <p v-if="!voidRows.length" class="gb-empty">该邮路下没有挂实寄封，可直接撤下。</p>
+      <el-table v-else :data="voidRows" border class="route-editor__void-table">
+        <el-table-column prop="coverNo" label="封号" width="100" />
+        <el-table-column label="收寄" min-width="140">
+          <template #default="{ row }">{{ row.sentFrom }} → {{ row.sentTo }}</template>
+        </el-table-column>
+        <el-table-column label="去向" min-width="220">
+          <template #default="{ row }">
+            <el-select v-model="row.choice" placeholder="请选择去向" style="width: 100%">
+              <el-option label="留作未关联" value="unattached" />
+              <el-option
+                v-for="opt in voidTargetOptions"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+              />
+            </el-select>
+          </template>
+        </el-table-column>
+      </el-table>
+      <p v-if="voidRows.length && !voidReady" class="route-editor__warn">
+        还有 {{ voidPending }} 封未指定去向，逐封处理完才能撤下邮路。
+      </p>
+      <template #footer>
+        <el-button @click="voidDialog = false">取消</el-button>
+        <el-button type="danger" :disabled="!voidReady" :loading="voiding" @click="confirmVoid">
+          确认作废并撤下
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="nodeDialog" title="新增邮路节点" width="520px">
       <el-form label-width="96px">
@@ -487,5 +610,17 @@ function nodeGanzhi(node: RouteNode): string {
   margin: 6px 0 0;
   font-size: 12px;
   color: var(--gb-muted);
+}
+.route-editor__danger {
+  border: 1px dashed #d8a49a;
+}
+.route-editor__danger .gb-panel__title {
+  color: #a43d2a;
+}
+.route-editor__danger .el-button {
+  margin-top: 10px;
+}
+.route-editor__void-table {
+  margin-top: 12px;
 }
 </style>

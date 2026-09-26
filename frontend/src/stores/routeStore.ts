@@ -18,6 +18,13 @@ export function createRouteNode(office = '', arriveDate = '', transitMark = ''):
   return { key: uid('node'), office, arriveDate, transitMark }
 }
 
+/** 作废方案中的一条：挂在邮路下的一封实寄封的去向。 */
+export interface VoidPlanItem {
+  coverId: number
+  /** 转挂目标邮路 id；null 表示留作未关联 */
+  targetRouteId: number | null
+}
+
 export const useRouteStore = defineStore('route', () => {
   const list = ref<PostalRoute[]>([])
   const loading = ref(false)
@@ -63,6 +70,42 @@ export const useRouteStore = defineStore('route', () => {
   async function remove(id: number): Promise<void> {
     await db.routes.delete(id)
     await load()
+  }
+
+  /**
+   * 作废并撤下邮路：按逐封方案把关联实寄封转挂到其他邮路或留作未关联，
+   * 随后删除邮路。全部写操作放在同一事务里——任一封没处理好，
+   * 邮路与其余封都保持不变。
+   */
+  async function voidRoute(id: number, plan: VoidPlanItem[]): Promise<void> {
+    const now = nowIso()
+    try {
+      await db.transaction('rw', db.routes, db.covers, async () => {
+        const route = await db.routes.get(id)
+        if (!route) throw new Error('该邮路不存在或已被撤下')
+        const attached = await db.covers.where('routeId').equals(id).toArray()
+        const planMap = new Map(plan.map((p) => [p.coverId, p.targetRouteId]))
+        const uncovered = attached.find((c) => typeof c.id !== 'number' || !planMap.has(c.id))
+        if (uncovered) throw new Error(`实寄封 ${uncovered.coverNo} 尚未指定去向`)
+        for (const item of plan) {
+          const cover = await db.covers.get(item.coverId)
+          if (!cover || cover.routeId !== id) {
+            throw new Error('有实寄封已不在该邮路下，请刷新后重试')
+          }
+          if (item.targetRouteId != null) {
+            if (item.targetRouteId === id) throw new Error('不能转挂到即将撤下的邮路')
+            const target = await db.routes.get(item.targetRouteId)
+            if (!target) throw new Error(`目标邮路 #${item.targetRouteId} 不存在`)
+          }
+        }
+        for (const item of plan) {
+          await db.covers.update(item.coverId, { routeId: item.targetRouteId, updatedAt: now })
+        }
+        await db.routes.delete(id)
+      })
+    } finally {
+      await load()
+    }
   }
 
   /** 节点拖拽排序 */
@@ -114,6 +157,7 @@ export const useRouteStore = defineStore('route', () => {
     create,
     update,
     remove,
+    voidRoute,
     moveNode,
     addNode,
     removeNode,
