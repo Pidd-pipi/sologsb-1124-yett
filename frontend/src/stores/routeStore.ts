@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { db } from '@/utils/db'
+import { db, voidPostalRoute, type CoverRouteAssignment, type VoidRouteResult } from '@/utils/db'
 import type { PostalRoute, RouteNode } from '@/types/route'
 import { daysBetween, isValidDate } from '@/utils/dateRange'
 import { nextSerialNo, nowIso, uid } from '@/utils/id'
@@ -60,9 +60,18 @@ export const useRouteStore = defineStore('route', () => {
     await load()
   }
 
-  async function remove(id: number): Promise<void> {
-    await db.routes.delete(id)
+  /**
+   * 作废邮路：逐封指定挂在其下实寄封的去向（另一条邮路 / 未关联），
+   * 邮路删除与封的归属改写在同一事务内提交，任一封处理失败则整体不动。
+   * 注意：调用方需在成功后自行 reload coverStore（跨 store 数据）。
+   */
+  async function voidRoute(
+    id: number,
+    assignments: CoverRouteAssignment
+  ): Promise<VoidRouteResult> {
+    const result = await voidPostalRoute(id, assignments)
     await load()
+    return result
   }
 
   /** 节点拖拽排序 */
@@ -113,7 +122,7 @@ export const useRouteStore = defineStore('route', () => {
     nextRouteNo,
     create,
     update,
-    remove,
+    voidRoute,
     moveNode,
     addNode,
     removeNode,

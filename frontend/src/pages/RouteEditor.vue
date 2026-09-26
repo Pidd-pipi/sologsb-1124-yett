@@ -2,10 +2,12 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { WarningFilled } from '@element-plus/icons-vue'
 import RouteTimeline from '@/components/common/RouteTimeline.vue'
 import { buildTimeline, useCoverRoute } from '@/hooks/useCoverRoute'
 import { computeTotalDays, createRouteNode, useRouteStore } from '@/stores/routeStore'
 import { useCoverStore } from '@/stores/coverStore'
+import type { CoverRouteAssignment } from '@/utils/db'
 import type { Cover } from '@/types/cover'
 import type { PostalRoute, RouteNode, TimelineNode } from '@/types/route'
 import { TRANSPORT_MODES, createEmptyRoute } from '@/types/route'
@@ -209,6 +211,86 @@ function openCover(cover: Cover): void {
   void router.push(`/covers/${cover.id}`)
 }
 
+/* ---------------------------- 作废邮路：逐封安置 ---------------------------- */
+
+const voidDialog = ref(false)
+const voiding = ref(false)
+/** 每封的去向：undefined 表示尚未逐封处理；null 表示留作未关联；数字表示转挂目标邮路 */
+const voidDestinations = ref<Record<number, number | null | undefined>>({})
+/** 打开作废弹窗瞬间挂在本邮路下的封，作为本次必须处理的清单快照 */
+const voidCovers = ref<Cover[]>([])
+
+/** 可转挂的其他邮路（不含本邮路），按邮路号排列 */
+const transferableRoutes = computed<PostalRoute[]>(() => {
+  const id = routeId.value
+  return routeStore.list.filter((r) => r.id !== id && typeof r.id === 'number')
+})
+
+interface VoidCoverRow {
+  cover: Cover
+  id: number
+  /** 选择的去向：undefined 待处理；null 留作未关联；数字 转挂目标 */
+  destination: number | null | undefined
+}
+
+const voidRows = computed<VoidCoverRow[]>(() =>
+  voidCovers.value
+    .filter((c): c is Cover & { id: number } => typeof c.id === 'number')
+    .map((cover) => ({ cover, id: cover.id, destination: voidDestinations.value[cover.id] }))
+)
+
+/** 尚未逐封处理完的封 */
+const pendingVoidCovers = computed(
+  () => voidRows.value.filter((row) => row.destination === undefined).length
+)
+
+const voidProgressText = computed(() => {
+  const total = voidRows.value.length
+  const done = total - pendingVoidCovers.value
+  return `${done} / ${total}`
+})
+
+function openVoidDialog(): void {
+  const id = routeId.value
+  if (id == null) return
+  voidCovers.value = coverStore.list.filter((c) => c.routeId === id)
+  voidDestinations.value = {}
+  voidDialog.value = true
+}
+
+async function confirmVoid(): Promise<void> {
+  const id = routeId.value
+  if (id == null || pendingVoidCovers.value > 0 || voiding.value) return
+  const assignments: CoverRouteAssignment = {}
+  for (const row of voidRows.value) {
+    if (row.destination === undefined) return
+    assignments[row.id] = row.destination
+  }
+  voiding.value = true
+  try {
+    const result = await routeStore.voidRoute(id, assignments)
+    // 跨 store：刷新实寄封列表，使归属变化立即生效
+    await coverStore.load()
+    voidDialog.value = false
+    ElMessage.success(
+      `邮路已作废，${result.moved} 封已转挂其他邮路，${result.detached} 封留作未关联`
+    )
+    void router.push('/covers')
+  } catch (err) {
+    // 事务已整体回滚：邮路与所有封都保持原样
+    ElMessage.error(`作废未生效（邮路与实寄封均未改动）：${(err as Error).message || '处理失败'}`)
+  } finally {
+    voiding.value = false
+  }
+}
+
+function destinationText(destination: number | null | undefined): string {
+  if (destination === undefined) return '待处理'
+  if (destination === null) return '留作未关联'
+  const target = routeStore.byId(destination)
+  return target ? `${target.routeNo} ${target.name}` : `邮路 #${destination}`
+}
+
 const createForm = reactive<PostalRoute>(createEmptyRoute())
 const creating = ref(false)
 
@@ -255,7 +337,10 @@ function nodeGanzhi(node: RouteNode): string {
           <template v-else>节点可拖拽排序、增删中转地，全程天数按节点日期自动计算。</template>
         </p>
       </div>
-      <el-button @click="router.push('/covers')">返回实寄封目录</el-button>
+      <div class="route-editor__actions">
+        <el-button v-if="route" type="danger" plain @click="openVoidDialog">作废邮路</el-button>
+        <el-button @click="router.push('/covers')">返回实寄封目录</el-button>
+      </div>
     </header>
 
     <template v-if="route">
@@ -421,6 +506,98 @@ function nodeGanzhi(node: RouteNode): string {
         <el-button type="primary" @click="submitNode">保存节点</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog
+      v-model="voidDialog"
+      title="作废邮路"
+      width="760px"
+      :close-on-click-modal="false"
+    >
+      <el-alert type="warning" :closable="false" show-icon class="route-editor__void-alert">
+        <template #title>
+          邮路作废后不可恢复。挂在
+          <strong>{{ route?.routeNo }} {{ route?.name }}</strong>
+          下的 {{ voidRows.length }} 封实寄封必须逐封安排去向：转挂到另一条可用邮路，或留作未关联。未全部处理完无法确认。
+        </template>
+      </el-alert>
+
+      <p v-if="!voidRows.length" class="gb-empty">
+        该邮路下未挂任何实寄封，可直接作废。
+      </p>
+      <template v-else>
+        <div class="route-editor__void-progress">
+          <el-icon><WarningFilled /></el-icon>
+          <span>
+            已处理 {{ voidProgressText }} 封
+            <template v-if="pendingVoidCovers">
+              ，还差 <strong>{{ pendingVoidCovers }}</strong> 封未安排去向
+            </template>
+          </span>
+        </div>
+        <el-table :data="voidRows" border stripe class="route-editor__void-table">
+          <el-table-column label="封号" width="110">
+            <template #default="{ row }">
+              <strong>{{ row.cover.coverNo }}</strong>
+            </template>
+          </el-table-column>
+          <el-table-column label="收寄地" min-width="150">
+            <template #default="{ row }">{{ row.cover.sentFrom }} → {{ row.cover.sentTo }}</template>
+          </el-table-column>
+          <el-table-column label="寄出日期" width="115">
+            <template #default="{ row }">{{ row.cover.postDate || '待考' }}</template>
+          </el-table-column>
+          <el-table-column label="去向" width="240">
+            <template #default="{ row }">
+              <el-select
+                v-model="voidDestinations[row.id]"
+                :placeholder="'逐封选择去向'"
+                style="width: 100%"
+              >
+                <el-option label="留作未关联" :value="null" />
+                <el-option
+                  v-for="target in transferableRoutes"
+                  :key="target.id"
+                  :label="`转挂 ${target.routeNo} ${target.name}`"
+                  :value="target.id"
+                />
+              </el-select>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="120">
+            <template #default="{ row }">
+              <el-tag
+                v-if="row.destination === undefined"
+                size="small"
+                type="warning"
+                effect="plain"
+              >
+                待处理
+              </el-tag>
+              <el-tag v-else size="small" type="success" effect="plain">
+                {{ destinationText(row.destination) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+        <p v-if="!transferableRoutes.length" class="route-editor__hint">
+          当前没有其他可用邮路，全部实寄封只能选择「留作未关联」；作废后仍可在实寄封目录重新挂路。
+        </p>
+        <p v-if="pendingVoidCovers" class="route-editor__void-remain">
+          还有 {{ pendingVoidCovers }} 封未处理，逐封选好去向后才能撤下邮路。
+        </p>
+      </template>
+      <template #footer>
+        <el-button :disabled="voiding" @click="voidDialog = false">取消</el-button>
+        <el-button
+          type="danger"
+          :loading="voiding"
+          :disabled="voidRows.length > 0 && pendingVoidCovers > 0"
+          @click="confirmVoid"
+        >
+          {{ voidRows.length ? `确认作废并安置 ${voidRows.length} 封` : '确认作废邮路' }}
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -487,5 +664,28 @@ function nodeGanzhi(node: RouteNode): string {
   margin: 6px 0 0;
   font-size: 12px;
   color: var(--gb-muted);
+}
+.route-editor__actions {
+  display: flex;
+  gap: 10px;
+}
+.route-editor__void-alert {
+  margin-bottom: 12px;
+}
+.route-editor__void-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--gb-muted);
+}
+.route-editor__void-progress .el-icon {
+  color: #b06f16;
+}
+.route-editor__void-remain {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: #b06f16;
 }
 </style>

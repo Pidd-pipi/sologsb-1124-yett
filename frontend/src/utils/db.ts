@@ -8,6 +8,7 @@ import type { Cover } from '@/types/cover'
 import type { PostalRoute } from '@/types/route'
 import type { StamplessEntry } from '@/types/stampentry'
 import type { AssetOwnerType, AssetSide, CatalogAsset } from '@/types/asset'
+import { nowIso } from '@/utils/id'
 
 export const DB_NAME = 'gbpostmark'
 /** 当前数据结构版本号，升级迁移写在下面对应的 version() 中 */
@@ -120,6 +121,69 @@ export async function loadAssets(
 ): Promise<CatalogAsset[]> {
   const rows = await db.assets.where('ownerId').equals(ownerId).toArray()
   return rows.filter((a) => a.ownerType === ownerType)
+}
+
+/**
+ * 作废邮路时，每封挂在其下的实寄封必须逐封指定去向：
+ * - 正数：转挂到另一条仍然可用的邮路
+ * - null：留作未关联
+ * 邮路删除与全部关联封的归属改写放在同一个 IndexedDB 事务内提交，
+ * 任一封处理失败（未指定去向、目标邮路不存在或目标即本邮路）时整体回滚，
+ * 邮路与其他封均保持原样。
+ */
+export type CoverRouteAssignment = Record<number, number | null>
+
+export interface VoidRouteResult {
+  /** 转挂到其他邮路的封数 */
+  moved: number
+  /** 留作未关联的封数 */
+  detached: number
+}
+
+export async function voidPostalRoute(
+  routeId: number,
+  assignments: CoverRouteAssignment
+): Promise<VoidRouteResult> {
+  return db.transaction('rw', db.routes, db.covers, async () => {
+    const route = await db.routes.get(routeId)
+    if (!route) throw new Error('该邮路已不存在，无需作废')
+
+    const covers = await db.covers.where('routeId').equals(routeId).toArray()
+    for (const cover of covers) {
+      if (typeof cover.id !== 'number') throw new Error(`实寄封 ${cover.coverNo} 缺少编号，无法转挂`)
+      if (!Object.prototype.hasOwnProperty.call(assignments, cover.id)) {
+        throw new Error(`实寄封 ${cover.coverNo} 尚未处理`)
+      }
+      const targetId = assignments[cover.id]
+      if (targetId != null) {
+        if (targetId === routeId) {
+          throw new Error(`实寄封 ${cover.coverNo} 不能转挂到正在作废的同一条邮路`)
+        }
+        const target = await db.routes.get(targetId)
+        if (!target) throw new Error(`实寄封 ${cover.coverNo} 选择的邮路已不存在`)
+      }
+    }
+
+    const timestamp = nowIso()
+    let moved = 0
+    let detached = 0
+    await Promise.all(
+      covers.map(async (cover) => {
+        const targetId = assignments[cover.id as number]
+        if (targetId == null) {
+          detached += 1
+        } else {
+          moved += 1
+        }
+        await db.covers.update(cover.id as number, {
+          routeId: targetId ?? null,
+          updatedAt: timestamp
+        })
+      })
+    )
+    await db.routes.delete(routeId)
+    return { moved, detached }
+  })
 }
 
 /* ------------------------------ 样例数据 ------------------------------ */
